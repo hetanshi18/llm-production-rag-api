@@ -1,0 +1,5 @@
+-r requirements.txt
+langchain-community
+langchain-text-splitters
+pypdf
+docx2txt

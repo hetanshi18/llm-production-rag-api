@@ -1,41 +1,29 @@
-"""RAG pipeline from Experiment 5, with a Groq LLM backend.
+"""Lightweight RAG pipeline (fits Render's 512 MB free tier).
 
-Everything heavy (embeddings, vector store) is built ONCE at import time.
+The index is built locally by build_index.py and loaded from disk here.
+Embeddings use fastembed (ONNX) instead of PyTorch; search is plain numpy.
 """
 import os
+import json
 import logging
 
+import numpy as np
 import requests
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from fastembed import TextEmbedding
 
 load_dotenv()
 log = logging.getLogger("support_rag")
 
-# ---------- Configuration (from .env / environment) ----------
+# ---------- Configuration ----------
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL")
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
 
-DATA_DIR = os.getenv("DATA_DIR", "data")
-CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
-
+# Distance between normalized vectors (lower = more similar, range 0-2).
+# If the best chunk is farther than this, treat the question as unsupported.
 MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "1.1"))
-
-# Chroma returns a DISTANCE (lower = more similar). If the best chunk is farther
-# than this, we treat the question as not covered by the knowledge base.
-# Tune it by testing a supported and an unsupported question (watch the log).
-MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "1.1"))
-
-KNOWLEDGE_FILES = [
-    ("diabetes.pdf", PyPDFLoader),
-    ("dengue.docx", Docx2txtLoader),
-    ("mental_health.txt", lambda p: TextLoader(p, encoding="utf-8")),
-]
 
 FALLBACK = "I don't have enough information in the provided knowledge base to answer that."
 
@@ -43,55 +31,36 @@ FALLBACK = "I don't have enough information in the provided knowledge base to an
 class BackendError(Exception):
     """Raised when the Groq LLM backend fails."""
 
-# ---------- Build once at import ----------
-def _load_documents():
-    docs = []
-    for filename, loader in KNOWLEDGE_FILES:
-        path = os.path.join(DATA_DIR, filename)
-        if os.path.exists(path):
-            docs.extend(loader(path).load())
-        else:
-            log.warning("Knowledge file missing: %s", path)
-    return docs
 
-
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-
-def _build_store():
-    if os.path.isdir(CHROMA_DIR) and os.listdir(CHROMA_DIR):
-        return Chroma(
-            collection_name="healthcare_rag",
-            embedding_function=embedding_model,
-            persist_directory=CHROMA_DIR,
-        )
-    documents = _load_documents()
-    if not documents:
-        raise RuntimeError(f"No documents found in '{DATA_DIR}/'. Add your files there.")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)
-    chunks = splitter.split_documents(documents)
-    return Chroma.from_documents(
-        documents=chunks,
-        embedding=embedding_model,
-        collection_name="healthcare_rag",
-        persist_directory=CHROMA_DIR,
-    )
-
-
-vector_store = _build_store()
+# ---------- Load once at import ----------
+_embedder = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+_embeddings = np.load("index_embeddings.npy")
+with open("index_chunks.json", encoding="utf-8") as f:
+    _chunks = json.load(f)
+log.info("Index loaded: %d chunks", len(_chunks))
 
 
 # ---------- Pipeline ----------
 def retrieve(question, k=6):
-    results = vector_store.similarity_search_with_score(question, k=k + 6)
-    results = [(d, s) for d, s in results if d.metadata.get("page", 99) >= 6]
+    """Return list of (chunk_dict, distance), best first."""
+    q = np.array(list(_embedder.embed([question]))[0], dtype=np.float32)
+    q /= np.linalg.norm(q)
+    dists = np.linalg.norm(_embeddings - q, axis=1)
+    order = np.argsort(dists)[: k + 8]
+    results = []
+    for i in order:
+        c = _chunks[i]
+        # skip front matter (title page / table of contents) of the PDF
+        if c["page"] is not None and c["page"] < 6:
+            continue
+        results.append((c, float(dists[i])))
     return results[:k]
+
 
 def call_llm(prompt):
     if not GROQ_API_KEY or not GROQ_MODEL:
         log.error("Groq API key or model is not configured.")
         raise BackendError("Groq configuration missing")
-
     try:
         r = requests.post(
             GROQ_URL,
@@ -101,12 +70,7 @@ def call_llm(prompt):
             },
             json={
                 "model": GROQ_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ],
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0,
                 "max_completion_tokens": 1024,
                 "reasoning_effort": "low",
@@ -114,32 +78,20 @@ def call_llm(prompt):
             },
             timeout=LLM_TIMEOUT,
         )
-
         r.raise_for_status()
-
         response = r.json()
         choice = response["choices"][0]
         answer = choice["message"].get("content")
-
-        log.info(
-            "Groq finish_reason=%s, usage=%s",
-            choice.get("finish_reason"),
-            response.get("usage"),
-        )
-
+        log.info("Groq finish_reason=%s usage=%s", choice.get("finish_reason"), response.get("usage"))
         if not answer or not answer.strip():
-            raise BackendError(
-                f"Groq returned empty content. "
-                f"Finish reason: {choice.get('finish_reason')}"
-            )
-
+            raise BackendError("Groq returned empty content")
         return answer.strip()
-
     except BackendError:
         raise
     except Exception as e:
         log.error("Groq backend failure: %s", type(e).__name__)
         raise BackendError(type(e).__name__) from e
+
 
 def answer_question(question):
     """Returns (answer, sources). Raises BackendError if the LLM fails."""
@@ -150,13 +102,10 @@ def answer_question(question):
     if not results or results[0][1] > MAX_DISTANCE:
         return FALLBACK, []
 
-    docs = [d for d, _ in results]
     context = "\n\n".join(
-        f"[Source: {os.path.basename(d.metadata.get('source', 'unknown'))}, "
-        f"Page: {d.metadata.get('page', 'unknown')}]\n{d.page_content}"
-        for d in docs
+        f"[Source: {c['source']}, Page: {c['page'] if c['page'] is not None else 'unknown'}]\n{c['text']}"
+        for c, _ in results
     )
-    # log.info("CONTEXT SENT TO LLM:\n%s", context)
 
     prompt = f"""
 You are a cautious educational healthcare information assistant.
@@ -183,7 +132,7 @@ ANSWER:
 """
     answer = call_llm(prompt)
     sources = sorted({
-        f"{os.path.basename(d.metadata.get('source', 'unknown'))} (page {d.metadata.get('page', 'n/a')})"
-        for d in docs
+        f"{c['source']} (page {c['page'] if c['page'] is not None else 'n/a'})"
+        for c, _ in results
     })
     return answer, sources
