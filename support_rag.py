@@ -1,4 +1,4 @@
-"""RAG pipeline from Experiment 5, with an Ollama LLM backend.
+"""RAG pipeline from Experiment 5, with a Groq LLM backend.
 
 Everything heavy (embeddings, vector store) is built ONCE at import time.
 """
@@ -16,11 +16,16 @@ load_dotenv()
 log = logging.getLogger("support_rag")
 
 # ---------- Configuration (from .env / environment) ----------
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5:0.5b")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL")
+
 DATA_DIR = os.getenv("DATA_DIR", "data")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
+
+MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "1.1"))
+
 # Chroma returns a DISTANCE (lower = more similar). If the best chunk is farther
 # than this, we treat the question as not covered by the knowledge base.
 # Tune it by testing a supported and an unsupported question (watch the log).
@@ -36,8 +41,7 @@ FALLBACK = "I don't have enough information in the provided knowledge base to an
 
 
 class BackendError(Exception):
-    """Raised when the LLM backend (Ollama / cloud API) fails."""
-
+    """Raised when the Groq LLM backend fails."""
 
 # ---------- Build once at import ----------
 def _load_documents():
@@ -78,30 +82,64 @@ vector_store = _build_store()
 
 
 # ---------- Pipeline ----------
-def retrieve(question, k=3):
-    """Return list of (Document, distance)."""
-    return vector_store.similarity_search_with_score(question, k=k)
-
+def retrieve(question, k=6):
+    results = vector_store.similarity_search_with_score(question, k=k + 6)
+    results = [(d, s) for d, s in results if d.metadata.get("page", 99) >= 6]
+    return results[:k]
 
 def call_llm(prompt):
+    if not GROQ_API_KEY or not GROQ_MODEL:
+        log.error("Groq API key or model is not configured.")
+        raise BackendError("Groq configuration missing")
+
     try:
         r = requests.post(
-            OLLAMA_URL,
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
             json={
-                "model": MODEL_NAME,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 180},
+                "model": GROQ_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                "temperature": 0,
+                "max_completion_tokens": 1024,
+                "reasoning_effort": "low",
+                "include_reasoning": False,
             },
             timeout=LLM_TIMEOUT,
         )
-        r.raise_for_status()
-        return r.json()["response"].strip()
-    except Exception as e:
-        # Details go to the log only; callers get a generic error.
-        log.error("LLM backend failure: %s", type(e).__name__)
-        raise BackendError(type(e).__name__) from e
 
+        r.raise_for_status()
+
+        response = r.json()
+        choice = response["choices"][0]
+        answer = choice["message"].get("content")
+
+        log.info(
+            "Groq finish_reason=%s, usage=%s",
+            choice.get("finish_reason"),
+            response.get("usage"),
+        )
+
+        if not answer or not answer.strip():
+            raise BackendError(
+                f"Groq returned empty content. "
+                f"Finish reason: {choice.get('finish_reason')}"
+            )
+
+        return answer.strip()
+
+    except BackendError:
+        raise
+    except Exception as e:
+        log.error("Groq backend failure: %s", type(e).__name__)
+        raise BackendError(type(e).__name__) from e
 
 def answer_question(question):
     """Returns (answer, sources). Raises BackendError if the LLM fails."""
@@ -118,14 +156,15 @@ def answer_question(question):
         f"Page: {d.metadata.get('page', 'unknown')}]\n{d.page_content}"
         for d in docs
     )
+    # log.info("CONTEXT SENT TO LLM:\n%s", context)
 
     prompt = f"""
 You are a cautious educational healthcare information assistant.
 
 Answer the question only using the supplied context.
 
-If the context does not contain enough information to answer the question,
-say that the information is not available in the provided knowledge base.
+If the context only partly answers the question, give what it does say and note what is missing.
+Only say the information is not available if the context has nothing relevant.
 
 Do not diagnose medical conditions.
 Do not prescribe medicines.
